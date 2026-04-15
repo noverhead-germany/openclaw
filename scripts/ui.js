@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+
 import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import { createRequire } from "node:module";
@@ -9,11 +10,7 @@ const here = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(here, "..");
 const uiDir = path.join(repoRoot, "ui");
 
-const WINDOWS_SHELL_EXTENSIONS = new Set([".cmd", ".bat", ".com"]);
-const WINDOWS_UNSAFE_SHELL_ARG_PATTERN = /[\r\n"&|<>^%!]/;
-
 function usage() {
-  // keep this tiny; it's invoked from npm scripts too
   process.stderr.write("Usage: node scripts/ui.js <install|dev|build|test> [...args]\n");
 }
 
@@ -23,25 +20,25 @@ function which(cmd) {
     const paths = (process.env[key] ?? process.env.PATH ?? "")
       .split(path.delimiter)
       .filter(Boolean);
+
     const extensions =
       process.platform === "win32"
         ? (process.env.PATHEXT ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean)
         : [""];
+
     for (const entry of paths) {
       for (const ext of extensions) {
         const candidate = path.join(entry, process.platform === "win32" ? `${cmd}${ext}` : cmd);
+
         try {
           if (fs.existsSync(candidate)) {
             return candidate;
           }
-        } catch {
-          // ignore
-        }
+        } catch {}
       }
     }
-  } catch {
-    // ignore
-  }
+  } catch {}
+
   return null;
 }
 
@@ -50,49 +47,52 @@ function resolveRunner() {
   if (pnpm) {
     return { cmd: pnpm, kind: "pnpm" };
   }
+
   return null;
 }
 
-export function shouldUseShellForCommand(cmd, platform = process.platform) {
-  if (platform !== "win32") {
-    return false;
-  }
-  const extension = path.extname(cmd).toLowerCase();
-  return WINDOWS_SHELL_EXTENSIONS.has(extension);
+function quoteForCmd(value) {
+  const stringValue = String(value);
+  return `"${stringValue.replace(/"/g, '""')}"`;
 }
 
-export function assertSafeWindowsShellArgs(args, platform = process.platform) {
-  if (platform !== "win32") {
-    return;
-  }
-  const unsafeArg = args.find((arg) => WINDOWS_UNSAFE_SHELL_ARG_PATTERN.test(arg));
-  if (!unsafeArg) {
-    return;
-  }
-  // SECURITY: `shell: true` routes through cmd.exe; reject risky metacharacters
-  // in forwarded args to prevent shell control-flow/env-expansion injection.
-  throw new Error(
-    `Unsafe Windows shell argument: ${unsafeArg}. Remove shell metacharacters (" & | < > ^ % !).`,
-  );
-}
-
-function createSpawnOptions(cmd, args, envOverride) {
-  const useShell = shouldUseShellForCommand(cmd);
-  if (useShell) {
-    assertSafeWindowsShellArgs(args);
-  }
+function createSpawnOptions(envOverride) {
   return {
     cwd: uiDir,
     stdio: "inherit",
     env: envOverride ?? process.env,
-    ...(useShell ? { shell: true } : {}),
+    shell: false,
   };
+}
+
+function spawnWindowsCommand(cmd, args, envOverride) {
+  const commandLine = [quoteForCmd(cmd), ...args.map(quoteForCmd)].join(" ");
+
+  return spawn(
+    process.env.ComSpec || "cmd.exe",
+    ["/d", "/s", "/c", commandLine],
+    createSpawnOptions(envOverride),
+  );
+}
+
+function spawnWindowsCommandSync(cmd, args, envOverride) {
+  const commandLine = [quoteForCmd(cmd), ...args.map(quoteForCmd)].join(" ");
+
+  return spawnSync(
+    process.env.ComSpec || "cmd.exe",
+    ["/d", "/s", "/c", commandLine],
+    createSpawnOptions(envOverride),
+  );
 }
 
 function run(cmd, args) {
   let child;
+
   try {
-    child = spawn(cmd, args, createSpawnOptions(cmd, args));
+    child =
+      process.platform === "win32"
+        ? spawnWindowsCommand(cmd, args)
+        : spawn(cmd, args, createSpawnOptions());
   } catch (err) {
     console.error(`Failed to launch ${cmd}:`, err);
     process.exit(1);
@@ -103,6 +103,7 @@ function run(cmd, args) {
     console.error(`Failed to launch ${cmd}:`, err);
     process.exit(1);
   });
+
   child.on("exit", (code) => {
     if (code !== 0) {
       process.exit(code ?? 1);
@@ -112,16 +113,22 @@ function run(cmd, args) {
 
 function runSync(cmd, args, envOverride) {
   let result;
+
   try {
-    result = spawnSync(cmd, args, createSpawnOptions(cmd, args, envOverride));
+    result =
+      process.platform === "win32"
+        ? spawnWindowsCommandSync(cmd, args, envOverride)
+        : spawnSync(cmd, args, createSpawnOptions(envOverride));
   } catch (err) {
     console.error(`Failed to launch ${cmd}:`, err);
     process.exit(1);
     return;
   }
+
   if (result.signal) {
     process.exit(1);
   }
+
   if ((result.status ?? 1) !== 0) {
     process.exit(result.status ?? 1);
   }
@@ -132,11 +139,13 @@ function depsInstalled(kind) {
     const require = createRequire(path.join(uiDir, "package.json"));
     require.resolve("vite");
     require.resolve("dompurify");
+
     if (kind === "test") {
       require.resolve("vitest");
       require.resolve("@vitest/browser-playwright");
       require.resolve("playwright");
     }
+
     return true;
   } catch {
     return false;
@@ -156,11 +165,13 @@ function resolveScriptAction(action) {
   if (action === "test") {
     return "test";
   }
+
   return null;
 }
 
 export function main(argv = process.argv.slice(2)) {
   const [action, ...rest] = argv;
+
   if (!action) {
     usage();
     process.exit(2);
@@ -184,9 +195,7 @@ export function main(argv = process.argv.slice(2)) {
   }
 
   if (!depsInstalled(action === "test" ? "test" : "build")) {
-    const installEnv = process.env;
-    const installArgs = ["install"];
-    runSync(runner.cmd, installArgs, installEnv);
+    runSync(runner.cmd, ["install"], process.env);
   }
 
   run(runner.cmd, ["run", script, ...rest]);
